@@ -1,2 +1,9 @@
 .idea
 .Ds_Store
+
+code/venv
+code/data
+code/result
+
+datasets
+models
