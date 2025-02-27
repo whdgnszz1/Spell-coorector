@@ -38,7 +38,10 @@ def get_ngram(text, n_gram):
 def calc_f_05(cor_sentence, prd_sentence, n_gram):
     prd_word_list = get_ngram(prd_sentence, n_gram)
     cor_word_list = get_ngram(cor_sentence, n_gram)
-    
+
+    if not prd_word_list or not cor_word_list:
+        return 0, 0, 0
+
     cnt = 0
     for idx in range(len(prd_word_list)):
         start_idx = 0
@@ -47,18 +50,15 @@ def calc_f_05(cor_sentence, prd_sentence, n_gram):
             start_idx = idx - 2
         if prd_word_list[idx] in cor_word_list[start_idx:end_idx]:
             cnt += 1
-    
-    if not prd_word_list:
-        return 0, 0, 0
-    
+
     precision = cnt / len(prd_word_list)
     recall = cnt / len(cor_word_list)
-    
-    if not (0.25 * precision + recall):
+
+    if precision + recall == 0:
         return 0, 0, 0
-    
+
     f_05 = 1.25 * (precision * recall) / (0.25 * precision + recall)
-    
+
     return precision, recall, f_05
 
 def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False):
@@ -82,7 +82,7 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     recall_list = []
     f_05_list = []
     
-    ngram = 6
+    ngram = 5
     data_len = len(dataset['test'])
     bar_length = 100
     if eval_length:
