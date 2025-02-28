@@ -1,76 +1,109 @@
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import datasets
 from transformers import DataCollatorForSeq2Seq
-from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, EarlyStoppingCallback
 import os
 import sys
 import json
 from datetime import datetime
 import argparse
 from omegaconf import OmegaConf
+from datasets import Dataset, DatasetDict, Features, Value
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
+
+        if labels is not None:
+            label_lengths = (labels != -100).sum(dim=1)
+            generated_lengths = (logits.argmax(dim=-1) != tokenizer.pad_token_id).sum(dim=1)
+            length_penalty = torch.clamp(generated_lengths - label_lengths, min=0).float()
+            loss += 0.05 * length_penalty.mean()  # 페널티 가중치 감소
+
+        return (loss, outputs) if return_outputs else loss
+
+
+def add_typo(sentence):
+    if len(sentence) < 2:
+        return sentence
+    idx = random.randint(0, len(sentence) - 1)
+    new_char = chr(random.randint(97, 122))
+    return sentence[:idx] + new_char + sentence[idx + 1:]
 
 
 def make_dataset(train_data_path_list, validation_data_path_list):
-    '''
-    데이터셋을 생성하는 함수
-
-    Args:
-        train_data_path_list (list): 학습 데이터 파일 경로 리스트
-        validation_data_path_list (list): 검증 데이터 파일 경로 리스트
-    Returns:
-        dataset (DatasetDict): 학습 및 검증 데이터셋
-    '''
     loaded_data_dict = {
-        'train': {'err_sentence': [], 'cor_sentence': [], 'case': []},
+        'train': {'err_sentence': [], 'cor_sentence': [], 'case': [], 'score': []},
         'validation': {'err_sentence': [], 'cor_sentence': [], 'case': []}
     }
 
-    # 학습 데이터 로드
     for i, train_data_path in enumerate(train_data_path_list):
         with open(train_data_path, 'r') as f:
             _temp_json = json.load(f)
-        loaded_data_dict['train']['err_sentence'].extend(
-            [x['annotation']['err_sentence'] for x in _temp_json['data']])
-        loaded_data_dict['train']['cor_sentence'].extend(
-            [x['annotation']['cor_sentence'] for x in _temp_json['data']])
-        loaded_data_dict['train']['case'].extend(
-            [x['annotation']['case'] for x in _temp_json['data']])
+        for x in _temp_json['data']:
+            err = x['annotation']['err_sentence']
+            cor = x['annotation']['cor_sentence']
+            case = str(x['annotation']['case'])
+            loaded_data_dict['train']['err_sentence'].append(err)
+            loaded_data_dict['train']['cor_sentence'].append(cor)
+            loaded_data_dict['train']['case'].append(case)
+            loaded_data_dict['train']['score'].append(1.0)
+
+            for _ in range(5):
+                if case in ['3']:
+                    augmented_err = add_typo(cor)
+                    loaded_data_dict['train']['err_sentence'].append(augmented_err)
+                    loaded_data_dict['train']['cor_sentence'].append(cor)
+                    loaded_data_dict['train']['case'].append(case)
+                    loaded_data_dict['train']['score'].append(0.5)
         print(f'train data {i} :', len(_temp_json['data']))
 
-    # 검증 데이터 로드
     for i, validation_data_path in enumerate(validation_data_path_list):
         with open(validation_data_path, 'r') as f:
             _temp_json = json.load(f)
         loaded_data_dict['validation']['err_sentence'].extend(
-            [x['annotation']['err_sentence'] for x in _temp_json['data']])
+            [x['annotation']['err_sentence'] for x in _temp_json['data']]
+        )
         loaded_data_dict['validation']['cor_sentence'].extend(
-            [x['annotation']['cor_sentence'] for x in _temp_json['data']])
+            [x['annotation']['cor_sentence'] for x in _temp_json['data']]
+        )
         loaded_data_dict['validation']['case'].extend(
-            [x['annotation']['case'] for x in _temp_json['data']])
+            [str(x['annotation']['case']) for x in _temp_json['data']]
+        )
         print(f'validation data {i} :', len(_temp_json['data']))
 
-    dataset_dict = {key: datasets.Dataset.from_dict(value, split=key)
-                    for key, value in loaded_data_dict.items()}
-    return datasets.DatasetDict(dataset_dict)
+    features = Features({
+        'err_sentence': Value('string'),
+        'cor_sentence': Value('string'),
+        'case': Value('string'),
+        'score': Value('float32')
+    })
+
+    dataset_dict = {
+        'train': Dataset.from_dict(loaded_data_dict['train'], split='train', features=features),
+        'validation': Dataset.from_dict(loaded_data_dict['validation'], split='validation', features=Features({
+            'err_sentence': Value('string'),
+            'cor_sentence': Value('string'),
+            'case': Value('string')
+        }))
+    }
+    return DatasetDict(dataset_dict)
 
 
 def preprocess_function(df, tokenizer, src_col, tgt_col, max_length):
-    '''
-    데이터 전처리 함수입니다.
-
-    Args:
-        df (Dataset): 데이터셋의 데이터
-        tokenizer (AutoTokenizer): 모델 토크나이저
-        src_col (str): 소스 열 이름
-        tgt_col (str): 타겟 열 이름
-        max_length (int): 최대 길이
-    Returns:
-        model_inputs (Dataset): 전처리된 입력 및 라벨 데이터
-    '''
     case_map = {
-        '1': '[KOR_TO_ENG]',  # 한국어를 영타로 친 경우
-        '2': '[ENG_TO_KOR]',  # 영어를 한타로 친 경우
-        '3': '[TYPO]'  # 한 글자 틀린 경우
+        '1': '[KOR_TO_ENG]',
+        '2': '[ENG_TO_KOR]',
+        '3': '[TYPO]'
     }
     inputs = [f"{case_map.get(case, '[UNKNOWN]')} {err}" for case, err in zip(df['case'], df[src_col])]
     targets = df[tgt_col]
@@ -86,6 +119,7 @@ def preprocess_function(df, tokenizer, src_col, tgt_col, max_length):
 def train(config):
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Model Load Start ======')
+    global tokenizer
     model = AutoModelForSeq2SeqLM.from_pretrained(config.pretrained_model_name).to("cpu")
     tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model_name)
     _now_time = datetime.now().__str__()
@@ -108,12 +142,12 @@ def train(config):
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=config.output_dir,
-        learning_rate=5e-5,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        num_train_epochs=20,
+        learning_rate=3e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=40,
         gradient_accumulation_steps=2,
-        warmup_ratio=0.1,
+        warmup_ratio=0.05,
         fp16=False,
         weight_decay=config.weight_decay,
         do_eval=config.do_eval,
@@ -128,21 +162,22 @@ def train(config):
         save_total_limit=1,
         load_best_model_at_end=True,
         dataloader_num_workers=0,
-        group_by_length=False,
+        group_by_length=True,
         report_to=None,
         ddp_find_unused_parameters=False,
+        label_smoothing_factor=0.1,
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = CustomSeq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset_tokenized['train'],
         eval_dataset=dataset_tokenized['validation'],
         tokenizer=tokenizer,
         data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
-    # 학습 시작
     trainer.train()
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
@@ -150,10 +185,6 @@ def train(config):
 
 
 if __name__ == '__main__':
-    '''
-    Usage:
-        python train.py --config-file config/base-config.yaml
-    '''
     parser = argparse.ArgumentParser()
     parser.add_argument('--config-file')
     args = parser.parse_args(sys.argv[1:])
