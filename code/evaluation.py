@@ -9,8 +9,9 @@ from tqdm import tqdm
 from datetime import datetime
 import argparse
 import Levenshtein
+import random
 
-def load_datasets(test_file):
+def load_datasets(test_file, sample_size=100):
     with open(test_file, 'r') as f:
         json_dataset = json.load(f)
 
@@ -20,8 +21,15 @@ def load_datasets(test_file):
         'cor_sentence': [data['annotation']['cor_sentence'] for data in json_dataset['data']]
     }
 
+    indices = random.sample(range(len(list_dataset['id'])), min(sample_size, len(list_dataset['id'])))
+    sampled_dataset = {
+        'id': [list_dataset['id'][i] for i in indices],
+        'err_sentence': [list_dataset['err_sentence'][i] for i in indices],
+        'cor_sentence': [list_dataset['cor_sentence'][i] for i in indices]
+    }
+
     dataset_dict = {
-        'test': datasets.Dataset.from_dict(list_dataset, split='test')
+        'test': datasets.Dataset.from_dict(sampled_dataset, split='test')
     }
     return datasets.DatasetDict(dataset_dict)
 
@@ -47,24 +55,19 @@ def remove_repetition(sentence):
             result.append(word)
     return ' '.join(result)
 
-def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False):
+def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=False):
     model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    dataset = load_datasets(test_file)
+    dataset = load_datasets(test_file, sample_size=100)
 
     device = torch.device(gpus)
     model.to(device)
 
     id_list, err_sentence_list, cor_sentence_list = [], [], []
-    prd_sentence_list_1, prd_sentence_list_2, prd_sentence_list_3 = [], [], []
-    accuracy_list_1, accuracy_list_2, accuracy_list_3 = [], [], []
-    edit_distance_list_1, edit_distance_list_2, edit_distance_list_3 = [], [], []
-    char_accuracy_list_1, char_accuracy_list_2, char_accuracy_list_3 = [], [], []
+    prd_sentence_list, accuracy_list, edit_distance_list, char_accuracy_list = [], [], [], []
 
     data_len = len(dataset['test'])
-    if eval_length:
-        data_len = min(eval_length, data_len)
 
     print('=' * 100)
     for n in tqdm(range(data_len), disable=pb):
@@ -85,7 +88,7 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         res = model.generate(
             inputs=input_ids,
             num_beams=10,
-            num_return_sequences=3,  # Generate 3 candidates
+            num_return_sequences=1,
             temperature=1.0,
             repetition_penalty=2.0,
             length_penalty=0.8,
@@ -99,63 +102,33 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
             top_p=0.95
         ).cpu().tolist()
 
-        prd_sentences = []
-        for i in range(min(3, len(res))):  # Handle cases where fewer than 3 are returned
-            prd_sentence = tokenizer.decode(res[i], skip_special_tokens=True).strip()
-            prd_sentence = remove_repetition(prd_sentence)
-            prd_words = prd_sentence.split()
-            prd_sentence = ' '.join(prd_words[:cor_word_count])
-            prd_sentences.append(prd_sentence)
+        prd_sentence = tokenizer.decode(res[0], skip_special_tokens=True).strip()
+        prd_sentence = remove_repetition(prd_sentence)
+        prd_words = prd_sentence.split()
+        prd_sentence = ' '.join(prd_words[:cor_word_count])
 
-        while len(prd_sentences) < 3:
-            prd_sentences.append("")
-
-        accuracy_1 = calc_accuracy(cor_sentence, prd_sentences[0])
-        accuracy_2 = calc_accuracy(cor_sentence, prd_sentences[1])
-        accuracy_3 = calc_accuracy(cor_sentence, prd_sentences[2])
-
-        edit_distance_1 = calc_edit_distance(cor_sentence, prd_sentences[0])
-        edit_distance_2 = calc_edit_distance(cor_sentence, prd_sentences[1])
-        edit_distance_3 = calc_edit_distance(cor_sentence, prd_sentences[2])
-
-        char_accuracy_1 = calc_char_accuracy(cor_sentence, prd_sentences[0])
-        char_accuracy_2 = calc_char_accuracy(cor_sentence, prd_sentences[1])
-        char_accuracy_3 = calc_char_accuracy(cor_sentence, prd_sentences[2])
+        accuracy = calc_accuracy(cor_sentence, prd_sentence)
+        edit_distance = calc_edit_distance(cor_sentence, prd_sentence)
+        char_accuracy = calc_char_accuracy(cor_sentence, prd_sentence)
 
         id_list.append(data_id)
         err_sentence_list.append(err_sentence)
         cor_sentence_list.append(cor_sentence)
-        prd_sentence_list_1.append(prd_sentences[0])
-        prd_sentence_list_2.append(prd_sentences[1])
-        prd_sentence_list_3.append(prd_sentences[2])
-        accuracy_list_1.append(accuracy_1)
-        accuracy_list_2.append(accuracy_2)
-        accuracy_list_3.append(accuracy_3)
-        edit_distance_list_1.append(edit_distance_1)
-        edit_distance_list_2.append(edit_distance_2)
-        edit_distance_list_3.append(edit_distance_3)
-        char_accuracy_list_1.append(char_accuracy_1)
-        char_accuracy_list_2.append(char_accuracy_2)
-        char_accuracy_list_3.append(char_accuracy_3)
+        prd_sentence_list.append(prd_sentence)
+        accuracy_list.append(accuracy)
+        edit_distance_list.append(edit_distance)
+        char_accuracy_list.append(char_accuracy)
 
         _cnt = n + 1
         _per_calc = round(_cnt / data_len, 4)
         _now_time = datetime.now().__str__()
         print(f'[{_now_time}] - [{_per_calc:6.1%} {_cnt:06,}/{data_len:06,}] - Evaluation Result (Data id : {data_id})')
         print(f'{" " * 30} >       TEST : {err_sentence}')
-        print(f'{" " * 30} >    PREDICT 1 : {prd_sentences[0]}')
-        print(f'{" " * 30} >    PREDICT 2 : {prd_sentences[1]}')
-        print(f'{" " * 30} >    PREDICT 3 : {prd_sentences[2]}')
+        print(f'{" " * 30} >    PREDICT : {prd_sentence}')
         print(f'{" " * 30} >      LABEL : {cor_sentence}')
-        print(f'{" " * 30} > ACCURACY 1 : {accuracy_1:6.3f}')
-        print(f'{" " * 30} > ACCURACY 2 : {accuracy_2:6.3f}')
-        print(f'{" " * 30} > ACCURACY 3 : {accuracy_3:6.3f}')
-        print(f'{" " * 30} > EDIT DISTANCE 1 : {edit_distance_1}')
-        print(f'{" " * 30} > EDIT DISTANCE 2 : {edit_distance_2}')
-        print(f'{" " * 30} > EDIT DISTANCE 3 : {edit_distance_3}')
-        print(f'{" " * 30} > CHAR ACCURACY 1 : {char_accuracy_1:6.3f}')
-        print(f'{" " * 30} > CHAR ACCURACY 2 : {char_accuracy_2:6.3f}')
-        print(f'{" " * 30} > CHAR ACCURACY 3 : {char_accuracy_3:6.3f}')
+        print(f'{" " * 30} > ACCURACY : {accuracy:6.3f}')
+        print(f'{" " * 30} > EDIT DISTANCE : {edit_distance}')
+        print(f'{" " * 30} > CHAR ACCURACY : {char_accuracy:6.3f}')
         print('=' * 100)
 
         torch.cuda.empty_cache()
@@ -165,42 +138,22 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     df = pd.DataFrame({
         'id': id_list,
         'err_sentence': err_sentence_list,
-        'prd_sentence_1': prd_sentence_list_1,
-        'prd_sentence_2': prd_sentence_list_2,
-        'prd_sentence_3': prd_sentence_list_3,
+        'prd_sentence': prd_sentence_list,
         'cor_sentence': cor_sentence_list,
-        'accuracy_1': accuracy_list_1,
-        'accuracy_2': accuracy_list_2,
-        'accuracy_3': accuracy_list_3,
-        'edit_distance_1': edit_distance_list_1,
-        'edit_distance_2': edit_distance_list_2,
-        'edit_distance_3': edit_distance_list_3,
-        'char_accuracy_1': char_accuracy_list_1,
-        'char_accuracy_2': char_accuracy_list_2,
-        'char_accuracy_3': char_accuracy_list_3
+        'accuracy': accuracy_list,
+        'edit_distance': edit_distance_list,
+        'char_accuracy': char_accuracy_list
     })
     df.to_csv(save_file_path, index=True)
     print(f'[{datetime.now()}] - Save Result File(.csv) - {save_file_path}')
 
     print('=' * 100)
-    mean_accuracy_1 = sum(accuracy_list_1) / len(accuracy_list_1)
-    mean_accuracy_2 = sum(accuracy_list_2) / len(accuracy_list_2)
-    mean_accuracy_3 = sum(accuracy_list_3) / len(accuracy_list_3)
-    mean_edit_distance_1 = sum(edit_distance_list_1) / len(edit_distance_list_1)
-    mean_edit_distance_2 = sum(edit_distance_list_2) / len(edit_distance_list_2)
-    mean_edit_distance_3 = sum(edit_distance_list_3) / len(edit_distance_list_3)
-    mean_char_accuracy_1 = sum(char_accuracy_list_1) / len(char_accuracy_list_1)
-    mean_char_accuracy_2 = sum(char_accuracy_list_2) / len(char_accuracy_list_2)
-    mean_char_accuracy_3 = sum(char_accuracy_list_3) / len(char_accuracy_list_3)
-    print(f'       Average Accuracy 1 : {mean_accuracy_1:6.3f}')
-    print(f'       Average Accuracy 2 : {mean_accuracy_2:6.3f}')
-    print(f'       Average Accuracy 3 : {mean_accuracy_3:6.3f}')
-    print(f'       Average Edit Distance 1 : {mean_edit_distance_1:6.3f}')
-    print(f'       Average Edit Distance 2 : {mean_edit_distance_2:6.3f}')
-    print(f'       Average Edit Distance 3 : {mean_edit_distance_3:6.3f}')
-    print(f'       Average Char Accuracy 1 : {mean_char_accuracy_1:6.3f}')
-    print(f'       Average Char Accuracy 2 : {mean_char_accuracy_2:6.3f}')
-    print(f'       Average Char Accuracy 3 : {mean_char_accuracy_3:6.3f}')
+    mean_accuracy = sum(accuracy_list) / len(accuracy_list)
+    mean_edit_distance = sum(edit_distance_list) / len(edit_distance_list)
+    mean_char_accuracy = sum(char_accuracy_list) / len(char_accuracy_list)
+    print(f'       Average Accuracy : {mean_accuracy:6.3f}')
+    print(f'       Average Edit Distance : {mean_edit_distance:6.3f}')
+    print(f'       Average Char Accuracy : {mean_char_accuracy:6.3f}')
     print('=' * 100)
 
 if __name__ == '__main__':
@@ -208,7 +161,6 @@ if __name__ == '__main__':
     parser.add_argument("--gpu_no", dest="gpu_no", type=int, action="store")
     parser.add_argument("--model_path", dest="model_path", type=str, action="store")
     parser.add_argument("--test_file", dest="test_file", type=str, action="store")
-    parser.add_argument("--eval_length", dest="eval_length", type=int, action="store")
     parser.add_argument("-pb", dest="pb", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
@@ -222,7 +174,6 @@ if __name__ == '__main__':
     pb = not args.pb
 
     print(f'[{datetime.now()}] ========== Evaluation Start ==========')
-    print(f'DEVICE : {gpu_no}, MODEL PATH : {args.model_path}, FILE PATH : {args.test_file}, DATA LENGTH : {args.eval_length}, SAVE PATH : {save_path}')
-    my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, eval_length=args.eval_length,
-             save_path=save_path, pb=pb)
+    print(f'DEVICE : {gpu_no}, MODEL PATH : {args.model_path}, FILE PATH : {args.test_file}, SAVE PATH : {save_path}')
+    my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, save_path=save_path, pb=pb)
     print(f'[{datetime.now()}] ========== Evaluation Finished ==========')

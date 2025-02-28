@@ -9,7 +9,6 @@ from datetime import datetime
 import argparse
 from omegaconf import OmegaConf
 from datasets import Dataset, DatasetDict, Features, Value
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,17 +26,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             label_lengths = (labels != -100).sum(dim=1)
             generated_lengths = (logits.argmax(dim=-1) != tokenizer.pad_token_id).sum(dim=1)
             length_penalty = torch.clamp(generated_lengths - label_lengths, min=0).float()
-            loss += 0.05 * length_penalty.mean()  # 페널티 가중치 감소
+            loss += 0.05 * length_penalty.mean()
 
         return (loss, outputs) if return_outputs else loss
-
-
-def add_typo(sentence):
-    if len(sentence) < 2:
-        return sentence
-    idx = random.randint(0, len(sentence) - 1)
-    new_char = chr(random.randint(97, 122))
-    return sentence[:idx] + new_char + sentence[idx + 1:]
 
 
 def make_dataset(train_data_path_list, validation_data_path_list):
@@ -57,14 +48,6 @@ def make_dataset(train_data_path_list, validation_data_path_list):
             loaded_data_dict['train']['cor_sentence'].append(cor)
             loaded_data_dict['train']['case'].append(case)
             loaded_data_dict['train']['score'].append(1.0)
-
-            for _ in range(5):
-                if case in ['3']:
-                    augmented_err = add_typo(cor)
-                    loaded_data_dict['train']['err_sentence'].append(augmented_err)
-                    loaded_data_dict['train']['cor_sentence'].append(cor)
-                    loaded_data_dict['train']['case'].append(case)
-                    loaded_data_dict['train']['score'].append(0.5)
         print(f'train data {i} :', len(_temp_json['data']))
 
     for i, validation_data_path in enumerate(validation_data_path_list):
